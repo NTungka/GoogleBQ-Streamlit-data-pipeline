@@ -1,0 +1,14 @@
+# Copy the 'olist' block below into ~/.dbt/profiles.yml (create the file if it
+# doesn't exist yet). Never commit your real profiles.yml -- it holds credentials.
+
+olist:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth               # uses your `gcloud auth application-default login` credentials
+      project: your-gcp-project-id
+      dataset: marts               # default dataset; staging/marts schemas are set per-folder in dbt_project.yml
+      location: US                 # match the region you created your BigQuery datasets/connection in
+      threads: 4
+      timeout_seconds: 300
