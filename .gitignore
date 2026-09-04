@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+
+dbt_olist/target/
+dbt_olist/logs/
+dbt_olist/dbt_packages/
+dbt_olist/package-lock.yml

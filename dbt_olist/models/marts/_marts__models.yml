@@ -1,0 +1,136 @@
+version: 2
+
+models:
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+
+  - name: dim_sellers
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - seller_id
+              - valid_from
+    columns:
+      - name: seller_id
+        tests: [not_null]
+
+  - name: dim_products
+    columns:
+      - name: product_id
+        tests: [unique, not_null]
+
+  - name: dim_geolocation
+    columns:
+      - name: zip_code_prefix
+        tests: [unique, not_null]
+
+  - name: dim_date
+    columns:
+      - name: date_day
+        tests: [unique, not_null]
+
+  - name: fct_orders
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_customers')
+                field: customer_id
+
+      # Anomaly-rate monitors, not row-level constraints. These flags are
+      # real, expected data (late deliveries, etc.) -- computed once in
+      # fct_orders.sql, never re-derived here. severity: warn means these
+      # can never fail `dbt build`; warn_if raises the threshold above the
+      # currently-observed count (~15-20% buffer) so normal operation stays
+      # green and only a genuine spike surfaces a warning. Thresholds are a
+      # starting point from the one-time integrity check baseline -- revisit
+      # as real ongoing data arrives.
+      - name: is_late_delivery                # baseline: ~7,827 / 99,441 orders
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "= false"
+              config:
+                severity: warn
+                warn_if: "> 9000"
+      - name: is_carrier_before_approved       # baseline: ~1,359 / 99,441 orders
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "= false"
+              config:
+                severity: warn
+                warn_if: "> 1600"
+      - name: is_delivered_missing_date        # baseline: ~8 / 99,441 orders
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "= false"
+              config:
+                severity: warn
+                warn_if: "> 20"
+      - name: has_no_line_items                # baseline: ~775 / 99,441 orders
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "= false"
+              config:
+                severity: warn
+                warn_if: "> 900"
+
+  - name: fct_order_items
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - order_id
+              - order_item_id
+    columns:
+      - name: order_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('fct_orders')
+                field: order_id
+      - name: product_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_products')
+                field: product_id
+      - name: seller_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_sellers')
+                field: seller_id
+
+  - name: fct_order_payments
+    columns:
+      - name: order_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('fct_orders')
+                field: order_id
+
+  - name: fct_order_reviews
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - review_id
+              - order_id
+    columns:
+      - name: order_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('fct_orders')
+                field: order_id
