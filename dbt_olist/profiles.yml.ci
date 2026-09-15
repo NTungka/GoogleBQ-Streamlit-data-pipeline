@@ -1,0 +1,16 @@
+# Baked into the Cloud Run Job's image (see Dockerfile) -- safe to commit,
+# unlike a real ~/.dbt/profiles.yml, because it holds no credentials.
+# `method: oauth` resolves via Application Default Credentials, which on
+# Cloud Run means the job's own runtime service account -- no keyfile.
+# See profiles.yml.example for the equivalent local-development version.
+olist:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: project-858e450f-408c-4bd2-941
+      dataset: staging
+      location: asia-southeast1
+      threads: 4
+      timeout_seconds: 300

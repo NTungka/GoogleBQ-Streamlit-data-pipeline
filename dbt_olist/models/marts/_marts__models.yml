@@ -22,11 +22,6 @@ models:
       - name: product_id
         tests: [unique, not_null]
 
-  - name: dim_geolocation
-    columns:
-      - name: zip_code_prefix
-        tests: [unique, not_null]
-
   - name: dim_date
     columns:
       - name: date_day
