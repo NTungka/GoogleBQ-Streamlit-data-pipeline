@@ -9,30 +9,79 @@ that one is the "what to type."
 
 ## Architecture
 
-```
-Kaggle (olistbr/brazilian-ecommerce)
-  -> pull_kaggle_to_gcs (Cloud Function, Cloud Scheduler cron)
-       only re-pulls when Kaggle's last-updated metadata moves
-    -> GCS bucket, raw/*.csv
-      -> load_gcs_to_bigquery (Cloud Function, GCS object-finalize trigger)
-           per-file CSV load -> staging table -> MERGE into `raw.<table>`
-           writes a completion marker; once all 9 tables have one, triggers
-           dbt-build-job and clears the markers for tomorrow
-        -> BigQuery `raw` dataset   (upsert: insert new, update matched, never truncate)
-          -> dbt-build-job (Cloud Run Job) -> `dbt build`
-            -> dbt staging models + star schema marts (dim_*, fct_*, incl. anomaly monitors)
-              -> Streamlit dashboard (Cloud Run service, reads star_schema_olist directly)
+Laid out the same way as `mod2_dbt_project/docs/GCP_project_configuration.md`'s
+own Mermaid diagram (trigger layer / compute layer / data layer subgraphs),
+so the two are easy to compare side by side. Unlike that diagram, every node
+and edge here is colored by verified deployment state, not just listed --
+**green solid** lines are confirmed live (`gcloud ... list` actually returns
+them), **orange dashed** lines are code that exists in this repo but was
+never provisioned in GCP, per the Status table in the main README.
 
-GitHub `main`, merge touching dbt_olist/**
-  -> Cloud Build trigger (path-filtered)
-    -> dbt-build-job (same Cloud Run Job as above) -> `dbt build`
+```mermaid
+flowchart TD
+
+    subgraph Trigger_Layer["Triggers & CI/CD Layer"]
+        SCHED[Cloud Scheduler: nightly cron]
+        GH[GitHub: push to main, dbt_olist/** changed]
+    end
+
+    subgraph Ingest_Layer["Ingestion (Cloud Functions, us-central1 equivalent)"]
+        CF_PULL[Cloud Function: pull_kaggle_to_gcs]
+        CF_LOAD[Cloud Function: load_gcs_to_bigquery]
+        MARKERS[/GCS completion markers + lock/]
+    end
+
+    subgraph Build_Layer["dbt Build (Cloud Run Job)"]
+        CB[Cloud Build trigger: dbt-build-trigger SA]
+        JOB_DBT[Cloud Run Job: dbt-build-job]
+    end
+
+    subgraph Data_Layer["Storage & Analytical Tier"]
+        GCS[(GCS bucket: raw/*.csv)]
+        BQ_RAW[(BigQuery: raw dataset)]
+        BQ_MARTS[(BigQuery: star_schema_olist)]
+    end
+
+    subgraph Serving_Layer["Serving"]
+        DASH[Cloud Run service: olist-dashboard]
+    end
+
+    KAGGLE([Kaggle: olistbr/brazilian-ecommerce]) -->|kaggle SDK, checks last-updated| CF_PULL
+    SCHED -->|invokes nightly| CF_PULL
+    CF_PULL -->|uploads 9 CSVs| GCS
+    GCS -->|Eventarc object-finalize| CF_LOAD
+    CF_LOAD -->|per-file MERGE upsert| BQ_RAW
+    CF_LOAD -->|writes marker per table| MARKERS
+
+    BQ_RAW ==>|"dbt build (run manually today)"| BQ_MARTS
+
+    MARKERS -.->|"9/9 markers -> run_job (never fires: job doesn't exist)"| JOB_DBT
+    GH -.->|webhook, path-filtered| CB
+    CB -.->|"gcloud run jobs execute (trigger never created)"| JOB_DBT
+    JOB_DBT -.->|dbt build| BQ_MARTS
+
+    BQ_MARTS -.->|BigQuery Read API| DASH
+
+    classDef done stroke:#2e7d32,stroke-width:2px,fill:#e8f5e9,color:#1b5e20;
+    classDef notdone stroke:#e65100,stroke-width:2px,stroke-dasharray:5 3,fill:#fff3e0,color:#e65100;
+
+    class KAGGLE,SCHED,CF_PULL,GCS,CF_LOAD,BQ_RAW,MARKERS,BQ_MARTS done;
+    class GH,CB,JOB_DBT,DASH notdone;
 ```
 
-Two independent paths reach the same `dbt-build-job`: one reacting to new
-*data* (event-driven, the top diagram), one reacting to new *code*
-(GitHub-merge-driven, the bottom one). Code for both Cloud Functions lives
-in `cloud_functions/`. See the main README's Status table for which of
-this is actually deployed and verified right now versus just written.
+Two independent paths were built to reach `dbt-build-job`: one reacting to
+new *data* (event-driven, via `MARKERS`), one reacting to new *code*
+(GitHub-merge-driven, via `CB`). Both are fully coded -- `cloud_functions/`
+for the data path, `cloudbuild.yaml` + the `dbt-build-trigger` service
+account for the code path -- but neither is actually provisioned: `gcloud
+run jobs list` and `gcloud builds triggers list` both come back empty, so
+`JOB_DBT` itself doesn't exist yet, both dashed edges into it are dead ends,
+and `dbt build` is 100% manual today (the solid green `BQ_RAW ==> BQ_MARTS`
+edge). The dashboard is coded and has been deployed and verified once, but
+is deliberately deleted between uses to avoid an unauthenticated public
+BigQuery-cost surface -- hence orange, not green, despite working code.
+See the main README's Status table for the line-by-line source of truth
+this diagram is generated from.
 
 ### Why a MERGE upsert instead of `WRITE_TRUNCATE`?
 
