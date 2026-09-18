@@ -1,9 +1,22 @@
 # Olist Marketplace Data Pipeline
 
 A data pipeline for Olist's Brazilian e-commerce marketplace dataset, built for a
-**BI/analytics dashboard** -- not a predictive-ML project. Raw historical order
-data is cleaned and constraint-validated in PostgreSQL, federated into
-BigQuery, and reshaped into a star schema with dbt for downstream dashboarding.
+**BI/analytics dashboard** -- not a predictive-ML project. The Kaggle source
+dataset is pulled into Cloud Storage on a schedule, merged into BigQuery, and
+reshaped into a star schema with dbt for downstream dashboarding. (An earlier
+Postgres/Cloud SQL staging path is parked, not deleted -- see
+[docs/automated_pipeline.md](docs/automated_pipeline.md#parked-postgres-staging).)
+
+This README covers overall design decisions and the current step-by-step CLI
+setup. Deeper rationale for each subsystem lives in its own doc:
+
+- [docs/automated_pipeline.md](docs/automated_pipeline.md) -- ingestion
+  architecture ("why"), the full IAM reference (every service account and
+  why it needs each role), and the parked Postgres path.
+- [docs/dbt_testing_and_staging.md](docs/dbt_testing_and_staging.md) -- the
+  star schema, SCD Type 2 reasoning, and what all 54 dbt tests actually check.
+- [docs/dashboard.md](docs/dashboard.md) -- the Streamlit dashboard's
+  multi-page structure, layout/chart provenance, and caching behavior.
 
 ## Business case
 
@@ -18,55 +31,74 @@ raw data already shows real signal on:
 - **Marketplace/seller health** -- order volume, revenue, and cancellation
   patterns across sellers and product categories.
 
-The pipeline is built around **constraint-first integrity** (Postgres enforces
-what's provably clean) plus **transparent flagging** (real anomalies are
-surfaced as queryable data, never silently dropped or hidden).
+The pipeline is built around **constraint-first integrity** (dbt tests enforce
+what's provably clean -- see [docs/dbt_testing_and_staging.md](docs/dbt_testing_and_staging.md))
+plus **transparent flagging** (real anomalies are surfaced as queryable data,
+never silently dropped or hidden).
 
 ## Architecture
 
 ```
-CSVs (data/)
-  -> PostgreSQL / Cloud SQL staging schema  (constraints enforced, CP-consistent)
-    -> BigQuery `raw` dataset               (federated EXTERNAL_QUERY materialization)
-      -> dbt staging models                 (typed/cleaned, 1:1 with source)
-        -> dbt star schema marts            (dim_*, fct_*)
-          -> BI dashboard tool (not yet connected)
+Kaggle (olistbr/brazilian-ecommerce)
+  -> pull_kaggle_to_gcs (Cloud Function, Cloud Scheduler cron)
+       only re-pulls when Kaggle's last-updated metadata moves
+    -> GCS bucket, raw/*.csv
+      -> load_gcs_to_bigquery (Cloud Function, GCS object-finalize trigger)
+           per-file CSV load -> staging table -> MERGE into `raw.<table>`
+           writes a completion marker; once all 9 tables have one, triggers
+           dbt-build-job and clears the markers for tomorrow
+        -> BigQuery `raw` dataset   (upsert: insert new, update matched, never truncate)
+          -> dbt-build-job (Cloud Run Job) -> `dbt build`
+            -> dbt staging models + star schema marts (dim_*, fct_*, incl. anomaly monitors)
+              -> Streamlit dashboard (Cloud Run service, reads star_schema_olist directly)
+
+GitHub `main`, merge touching dbt_olist/**
+  -> Cloud Build trigger (path-filtered)
+    -> dbt-build-job (same Cloud Run Job as above) -> `dbt build`
 ```
 
-**Why Postgres for staging, not straight to BigQuery?** Chosen deliberately
-via a CAP-theorem lens: this is a batch-loaded, non-real-time source, so
-sacrificing Availability for Consistency + Partition tolerance was the right
-trade -- a CP relational database lets constraint violations get caught at
-write time (PK/FK/CHECK), rather than discovered after the fact.
-
-**Why federated `EXTERNAL_QUERY` instead of a Python mover script or
-GCS-staged load?** No intermediate copy step, no separate compute to run and
-pay for -- BigQuery reads Cloud SQL directly through a secure, IAM-authenticated
-connection. Traded off against a Python-script mover (more control, more
-moving parts) and GCS-staged loading (heavier, more GCP-native for larger
-scale); federation was the leanest fit for this data's size and cadence.
+Two independent paths reach the same `dbt-build-job`: one reacting to new
+*data* (event-driven), one reacting to new *code* (GitHub-merge-driven).
+Code for both Cloud Functions lives in `cloud_functions/`. **Full rationale
+for every "why" behind this diagram -- MERGE vs `WRITE_TRUNCATE`, one
+function vs two, the Kaggle API quirks, the two CSV load bugs, why the dbt
+trigger uses completion markers -- is in
+[docs/automated_pipeline.md](docs/automated_pipeline.md).**
 
 ## Status
+
+Verified live against the actual deployed project, not just design intent:
 
 | Stage | Status |
 |---|---|
 | Data integrity check (9 raw CSVs) | Done -- solid referential integrity overall; found duplicate geolocation rows, timestamp anomalies, late deliveries, orphan categories (see `src/data_integrity_check.py`) |
-| Postgres staging schema (Cloud SQL) | Done -- constraints enforced only where zero violations were verified; anomalies deliberately left unblocked |
-| Cloud SQL instance + connectivity | Done -- Public IP + Cloud SQL Python Connector (IAM-auth, no IP allowlisting) |
-| BigQuery <-> Cloud SQL federated connection | Done |
-| Raw data materialized into BigQuery | Done -- 9 tables in `raw` dataset via `EXTERNAL_QUERY` |
-| dbt star schema (staging + marts) | Done -- all models and tests passing |
-| Anomaly monitoring | Done -- warn-severity dbt tests on `fct_orders` flag columns |
+| Postgres staging schema (Cloud SQL) | **Parked** -- superseded by the GCS/BigQuery pipeline below; scripts kept in `src/` for reference, see [docs/automated_pipeline.md](docs/automated_pipeline.md#parked-postgres-staging) |
+| BigQuery <-> Cloud SQL federated connection | **Parked** -- replaced by the two Cloud Functions below |
+| `pull_kaggle_to_gcs` (Kaggle -> GCS) | **Done** -- deployed, `ACTIVE`, nightly Cloud Scheduler job confirmed `ENABLED` |
+| `load_gcs_to_bigquery` (GCS -> BigQuery, MERGE upsert) | **Done** -- deployed, `ACTIVE`, Eventarc GCS trigger confirmed live |
+| Raw data materialized into BigQuery | **Done** -- all 9 `raw.*` tables confirmed populated |
+| dbt star schema (staging + marts) | **Done** -- all 8 marts confirmed populated; built via a manual `dbt build`, see next row |
+| `dbt-build-job` automation (code-triggered, Cloud Build) | **Written, not provisioned** -- `gcloud run jobs list` and `gcloud builds triggers list` both come back empty; the Cloud Run Job and the GitHub-merge trigger were never actually created, and the one-time manual GitHub-App-connection step wasn't completed. `dbt build` is 100% manual today despite this code existing |
+| `dbt-build-job` automation (data-triggered, event-driven) | **Written, not provisioned** -- same root cause: depends on `dbt-build-job` existing, which it doesn't yet |
+| Anomaly monitoring | Done -- warn-severity dbt tests on `fct_orders` flag columns, see [docs/dbt_testing_and_staging.md](docs/dbt_testing_and_staging.md) |
 | SCD Type 2 (seller location) | Done -- `dbt snapshot` on sellers |
-| Automation/scheduling | **Not started** -- all steps currently run manually |
-| Dashboard/BI tool connection | **Not started** |
+| Dashboard/BI tool connection | **Not currently deployed** -- built, deployed once, verified working, then deliberately deleted (`gcloud run services delete`, not just idled) to close the public `--allow-unauthenticated` URL while unused; absent from `gcloud run services list` right now. Redeploy with the step 9 command any time, nothing lost |
+
+**No component in this pipeline redeploys itself on a code push.** Every
+deploy for every service (both Cloud Functions, the dashboard) is a manual
+`gcloud` command run from "How to run" below. The one CI/CD mechanism
+anyone designed here -- the dbt Cloud Build trigger -- exists only as code
+and documentation, not as a provisioned resource yet (see the table above).
 
 ## Project structure
 
 ```
 .
 ├── data/                    Raw Olist CSVs + integrity-check output
-├── src/                     Standalone pipeline scripts
+├── cloud_functions/          Active ingestion pipeline (Kaggle -> GCS -> BigQuery)
+│   ├── pull_kaggle_to_gcs/     Cloud Scheduler-triggered pull, skips unchanged data
+│   └── load_gcs_to_bigquery/   GCS-triggered load + MERGE upsert into `raw`
+├── src/                     Parked Postgres pipeline scripts (see docs/automated_pipeline.md)
 │   ├── data_integrity_check.py
 │   ├── staging_schema.sql
 │   ├── apply_schema.py
@@ -75,59 +107,143 @@ scale); federation was the leanest fit for this data's size and cadence.
 │   ├── models/staging/
 │   ├── models/marts/
 │   ├── snapshots/
-│   └── macros/
+│   ├── macros/
+│   ├── Dockerfile               dbt-build-job image (Cloud Run Job)
+│   ├── .dockerignore
+│   └── profiles.yml.ci          Baked-in, secret-free profile (method: oauth)
+├── cloudbuild.yaml            Cloud Build config for dbt-build-job (repo root)
+├── dashboard/                 Streamlit dashboard (Cloud Run service), multi-page
+│   ├── app.py                   Entry point: page config, shared sidebar filters, navigation
+│   ├── common.py                 BigQuery client, cached queries, filter helpers (shared by all pages)
+│   ├── pages/                    One file per business-case question (see docs/dashboard.md)
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .streamlit/config.toml
+├── docs/                     Design-rationale docs (see links at the top of this file)
+│   ├── automated_pipeline.md
+│   ├── dbt_testing_and_staging.md
+│   └── dashboard.md
 ├── notebooks/                Exploratory notebook(s)
-├── .env.example               Template for Cloud SQL connection details
+├── .env.example               Template for the parked Postgres path's connection details
 └── .gitignore
 ```
 
 ## How to run
 
+Values below are this project's actual GCP project (`project-858e450f-408c-4bd2-941`,
+project number `588691405952`), region (`asia-southeast1` -- matches the
+existing `raw` BigQuery dataset's location), and bucket name
+(`project-858e450f-408c-4bd2-941-olist-raw`). Commands are PowerShell. This
+sequence already follows the dependency-safe order (why it's ordered this
+way is in [docs/automated_pipeline.md](docs/automated_pipeline.md#correct-order-for-a-from-scratch-setup)).
+
 ### Prerequisites
 
-- Python with `pandas`, `sqlalchemy`, `cloud-sql-python-connector[pg8000]`,
-  `python-dotenv` installed
-- `dbt-core` + `dbt-bigquery` installed
 - `gcloud` CLI installed and authenticated (`gcloud auth application-default login`)
-- A Cloud SQL for PostgreSQL instance and a BigQuery project already created
+- A Kaggle account with an API token: kaggle.com -> Account -> Settings ->
+  API -> **Create New Token** -> downloads `kaggle.json` (`{"username": ..., "key": ...}`)
+- `dbt-core` + `dbt-bigquery` installed
 
-### 1. Configure credentials
-
-```
-cp .env.example .env
-```
-Fill in `INSTANCE_CONNECTION_NAME`, `DB_USER`, `DB_PASS`, `DB_NAME`.
-
-### 2. Load raw CSVs into Postgres (Cloud SQL)
-
-```
-cd src
-python apply_schema.py       # creates the staging schema + all 9 tables/constraints
-python load_to_cloudsql.py   # loads all 9 CSVs, FK-safe order
-```
-
-### 3. Federate Cloud SQL into BigQuery
-
-One-time setup (see full command reference in project history / ask if you
-need the exact `bq mk --connection` / IAM-grant commands re-shared):
-
-```
-gcloud services enable bigqueryconnection.googleapis.com
-bq mk --connection --connection_type=CLOUD_SQL ...
-bq mk --dataset --location=<region> <project>:raw
-```
-
-Then, on every refresh:
+### 1. Enable required APIs (one-time)
 
 ```powershell
-$conn = "<project>.<region>.<connection_name>"
-$tables = @("customers","sellers","category_translation","products","geolocation_raw","orders","order_items","order_payments","order_reviews")
-foreach ($t in $tables) {
-    bq query --use_legacy_sql=false --location=<region> "CREATE OR REPLACE TABLE raw.$t AS SELECT * FROM EXTERNAL_QUERY('$conn', 'SELECT * FROM staging.$t')"
-}
+gcloud services enable cloudfunctions.googleapis.com cloudscheduler.googleapis.com cloudbuild.googleapis.com eventarc.googleapis.com artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com pubsub.googleapis.com --project=project-858e450f-408c-4bd2-941
 ```
 
-### 4. Run the dbt transformation
+### 2. Store Kaggle credentials in Secret Manager
+
+Open the downloaded `kaggle.json` and copy the `username`/`key` values in below
+(`-NoNewline` matters -- a trailing newline in the key breaks Kaggle auth):
+
+```powershell
+Set-Content -Path "$env:TEMP\kaggle-username.txt" -Value "<your-kaggle-username>" -NoNewline
+gcloud secrets create kaggle-username --data-file="$env:TEMP\kaggle-username.txt" --project=project-858e450f-408c-4bd2-941
+
+Set-Content -Path "$env:TEMP\kaggle-key.txt" -Value "<your-kaggle-api-key>" -NoNewline
+gcloud secrets create kaggle-key --data-file="$env:TEMP\kaggle-key.txt" --project=project-858e450f-408c-4bd2-941
+
+Remove-Item "$env:TEMP\kaggle-username.txt", "$env:TEMP\kaggle-key.txt"
+```
+
+### 3. Grant IAM roles
+
+See [docs/automated_pipeline.md's IAM reference](docs/automated_pipeline.md#iam-reference-every-service-account-and-why)
+for what each grant below is for and how it was discovered.
+
+Force-provision the two Google-managed service agents first -- granting
+their roles before they exist fails outright:
+
+```powershell
+gcloud storage service-agent --project=project-858e450f-408c-4bd2-941
+gcloud beta services identity create --service=eventarc.googleapis.com --project=project-858e450f-408c-4bd2-941
+```
+
+Then grant the default compute service account
+(`588691405952-compute@developer.gserviceaccount.com`) everything it needs
+*except* the `run.invoker`/`run.developer` bindings on resources that don't
+exist yet:
+
+```powershell
+gcloud secrets add-iam-policy-binding kaggle-username --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor" --project=project-858e450f-408c-4bd2-941
+gcloud secrets add-iam-policy-binding kaggle-key --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor" --project=project-858e450f-408c-4bd2-941
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/bigquery.dataEditor"
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/bigquery.jobUser"
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/cloudbuild.builds.builder"
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/eventarc.eventReceiver"
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:service-588691405952@gs-project-accounts.iam.gserviceaccount.com" --role="roles/pubsub.publisher"
+```
+
+### 4. Create the bucket and staging dataset (one-time)
+
+`raw` already exists (from the parked Postgres path) -- only `raw_stage` is new:
+
+```powershell
+gcloud storage buckets create gs://project-858e450f-408c-4bd2-941-olist-raw --project=project-858e450f-408c-4bd2-941 --location=asia-southeast1 --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://project-858e450f-408c-4bd2-941-olist-raw --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/storage.objectAdmin"
+bq mk --dataset --location=asia-southeast1 project-858e450f-408c-4bd2-941:raw_stage
+```
+
+### 5. Deploy `pull-kaggle-to-gcs` + its schedule
+
+Gen2 function *resource names* follow Cloud Run naming (hyphens, no
+underscores) even though the Python entry-point function is still
+`pull_kaggle_to_gcs`:
+
+```powershell
+gcloud functions deploy pull-kaggle-to-gcs --gen2 --runtime=python312 --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --source=cloud_functions/pull_kaggle_to_gcs --entry-point=pull_kaggle_to_gcs --trigger-http --no-allow-unauthenticated --memory=512Mi --timeout=300s --set-env-vars=BUCKET_NAME=project-858e450f-408c-4bd2-941-olist-raw --set-secrets='KAGGLE_USERNAME=kaggle-username:latest,KAGGLE_KEY=kaggle-key:latest'
+
+gcloud iam service-accounts create scheduler-invoker --project=project-858e450f-408c-4bd2-941 --display-name="Cloud Scheduler invoker for pull-kaggle-to-gcs"
+gcloud functions add-invoker-policy-binding pull-kaggle-to-gcs --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --member="serviceAccount:scheduler-invoker@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com"
+
+$FUNCTION_URL = gcloud functions describe pull-kaggle-to-gcs --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --format="value(serviceConfig.uri)"
+gcloud scheduler jobs create http pull-kaggle-nightly --project=project-858e450f-408c-4bd2-941 --location=asia-southeast1 --schedule="0 3 * * *" --uri=$FUNCTION_URL --http-method=POST --oidc-service-account-email="scheduler-invoker@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com"
+```
+
+### 6. Deploy `load-gcs-to-bigquery` (GCS-triggered)
+
+```powershell
+gcloud functions deploy load-gcs-to-bigquery --gen2 --runtime=python312 --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --source=cloud_functions/load_gcs_to_bigquery --entry-point=load_gcs_to_bigquery --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" --trigger-event-filters="bucket=project-858e450f-408c-4bd2-941-olist-raw" --trigger-location=asia-southeast1 --set-env-vars='GCP_PROJECT_ID=project-858e450f-408c-4bd2-941,RAW_DATASET=raw,STAGE_DATASET=raw_stage'
+```
+
+Now that the service exists, grant the last deferred binding from step 3 --
+the Eventarc trigger's identity (the default compute SA) needs this to
+actually invoke the function, not just receive the event:
+
+```powershell
+gcloud functions add-invoker-policy-binding load-gcs-to-bigquery --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com"
+```
+
+### 7. Verify
+
+```powershell
+gcloud functions call pull-kaggle-to-gcs --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --gen2
+gcloud functions logs read pull-kaggle-to-gcs --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --gen2 --limit=50
+gcloud functions logs read load-gcs-to-bigquery --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --gen2 --limit=50
+gcloud storage ls gs://project-858e450f-408c-4bd2-941-olist-raw/raw/
+bq query --use_legacy_sql=false --project_id=project-858e450f-408c-4bd2-941 "SELECT COUNT(*) FROM raw.orders"
+```
+
+### 8. Run the dbt transformation
 
 ```
 cd dbt_olist
@@ -136,160 +252,127 @@ dbt build
 ```
 
 This runs staging views, the star schema marts, the seller snapshot, and all
-tests together. Produces `staging.*` (typed/cleaned views), `star_schema_olist.*`
-(the star schema), and `snapshots.sellers_snapshot`.
+54 tests together (see [docs/dbt_testing_and_staging.md](docs/dbt_testing_and_staging.md)
+for what each one checks). Produces `staging.*` (typed/cleaned views),
+`star_schema_olist.*` (the star schema), and `snapshots.sellers_snapshot`.
 
-## dbt design notes
+### 9. Deploy the dashboard
 
-### Why constraints are split between Postgres and dbt tests
+`dashboard/` is a native Streamlit multi-page app -- see
+[docs/dashboard.md](docs/dashboard.md) for its structure, layout
+provenance, and caching behavior.
 
-Postgres enforces structural rules with **zero known violations** at write
-time (PK/FK uniqueness, `price > 0`, `review_score` 1-5, etc.) -- real
-rejection, not just reporting. dbt tests re-assert the same rules at the
-BigQuery layer (catches transfer/load bugs Postgres can't see) and additionally
-carry the **anomaly monitors**: `is_late_delivery`, `is_carrier_before_approved`,
-`is_delivered_missing_date`, `has_no_line_items` are computed once as columns
-on `fct_orders`, then watched by `warn`-severity tests thresholded ~15-20%
-above their known baseline rate -- normal operation stays green, only a
-genuine spike surfaces a warning. These are never hard-enforced as CHECK
-constraints because they're real, expected data, not corruption; rejecting
-them would silently drop legitimate orders.
-
-### Why SCD Type 2 (`dbt snapshot`) only for sellers
-
-A live pipeline (as opposed to this project's historical batch load) means
-dimension attributes can genuinely change after facts referencing them
-already exist. The decision to snapshot uses one test: **does a fact table
-need the dimension's value as of the time the fact occurred, not just its
-current value?**
-
-Every dimension in the star schema was reviewed against that test:
-
-| Dimension | Verdict | Reasoning |
-|---|---|---|
-| **`dim_sellers` (location)** | **Type 2 -- implemented** | Regional delivery/performance analysis needs a seller's location *at the time of each order*. If a seller relocates, historical shipping-performance numbers must not be silently rewritten to reflect their new location. This is the one case where the "genuine change + historical facts need point-in-time accuracy" test clearly holds. |
-| `dim_customers` (address) | Reviewed, not implemented | Symmetric reasoning to sellers -- *but* Olist's `customer_id` is already one row per order (not per person; `customer_unique_id` is the repeat-customer key), so the source data already captures "address at time of order" structurally. Only becomes a real gap if a live system redesigns customers into one-row-per-person with in-place updates -- worth re-checking against the actual live source design before adding. |
-| `dim_products` (category) | Reviewed, not implemented | Depends on *why* a category changes. A correction of bad data should propagate everywhere (Type 1); only a genuine reclassification needing point-in-time-accurate historical reporting would warrant Type 2. Left undecided pending that business clarification. |
-| `dim_products` (weight/dimensions) | Reviewed, not implemented | Freight-cost analysis is tied to weight at time of shipment, so this looked like a candidate at first glance -- but a product's physical weight doesn't genuinely change; an updated value is almost always a data correction (originally mismeasured), which argues for Type 1, not Type 2. |
-| `dim_geolocation` (zip mapping) | Reviewed, not implemented | Postal boundary reassignment happens in reality but is rare and low business value here -- not worth the complexity. |
-| `category_translation` | Reviewed, not implemented | A translation fix is a correction, not a business event. |
-| Order status lifecycle | Reviewed, not implemented (yet) | Currently captured via dedicated timestamp columns on `orders` (purchase/approved/carrier/delivered), which is a cleaner fit than SCD for this specific shape of history. Worth revisiting if a live system adds status types (canceled/returned/refunded) with no dedicated timestamp column and only mutates a generic `order_status` field -- at that point, snapshotting `order_status` becomes the practical fallback. |
-
-So: one clear "yes" (sellers), several "reviewed and reasoned no" (not simply
-skipped), and two genuinely conditional cases (customers, products) deferred
-pending source-system design decisions rather than guessed at.
-
-### `sellers_snapshot` implementation
-
-- **Strategy**: `check` (compares `seller_zip_code_prefix`, `seller_city`,
-  `seller_state`) -- there's no `updated_at` column in the source to use a
-  `timestamp` strategy instead.
-- **Sources from `raw.sellers` directly**, not `stg_sellers` -- dbt best
-  practice, so snapshot history survives even if staging transformation logic
-  changes later.
-- `dim_sellers` is now genuinely Type 2: one row per `(seller_id, valid_from)`,
-  exposing `valid_from` / `valid_to` / `is_current`. A fact-to-dimension join
-  needing point-in-time accuracy should join on `seller_id` **and**
-  `shipping_limit_date BETWEEN valid_from AND COALESCE(valid_to, '9999-12-31')`,
-  not a plain equi-join on `seller_id` alone.
-- History only starts accumulating from the point the snapshot first ran --
-  the initial run just establishes a baseline (every seller gets one row).
-  The payoff shows up once a seller's location actually changes in a
-  subsequent run against a live, changing source.
-
-## Star schema
-
-```mermaid
-erDiagram
-    dim_customers ||--o{ fct_orders : places
-    dim_date ||--o{ fct_orders : "purchase date"
-    fct_orders ||--o{ fct_order_items : contains
-    fct_orders ||--o{ fct_order_payments : "paid via"
-    fct_orders ||--o{ fct_order_reviews : "reviewed by"
-    dim_products ||--o{ fct_order_items : is
-    dim_sellers ||--o{ fct_order_items : fulfills
-
-    dim_customers {
-        string customer_id PK
-        string customer_unique_id
-        int customer_zip_code_prefix
-        string customer_city
-        string customer_state
-    }
-    dim_sellers {
-        string seller_id PK
-        timestamp valid_from PK
-        timestamp valid_to
-        bool is_current
-        int seller_zip_code_prefix
-        string seller_city
-        string seller_state
-    }
-    dim_products {
-        string product_id PK
-        string product_category_name
-        string product_category_name_english
-        float product_weight_g
-        float product_length_cm
-        float product_height_cm
-        float product_width_cm
-    }
-    dim_date {
-        date date_day PK
-        int year
-        int month
-        string day_name
-        bool is_weekend
-    }
-    fct_orders {
-        string order_id PK
-        string customer_id FK
-        string order_status
-        timestamp order_purchase_timestamp
-        timestamp order_delivered_customer_date
-        bool is_late_delivery
-        bool is_carrier_before_approved
-        bool is_delivered_missing_date
-        bool has_no_line_items
-    }
-    fct_order_items {
-        string order_id FK
-        int order_item_id PK
-        string product_id FK
-        string seller_id FK
-        float price
-        float freight_value
-    }
-    fct_order_payments {
-        string order_id FK
-        int payment_sequential PK
-        string payment_type
-        int payment_installments
-        float payment_value
-    }
-    fct_order_reviews {
-        string review_id PK
-        string order_id FK
-        int review_score
-        timestamp review_creation_date
-    }
+```powershell
+gcloud run deploy olist-dashboard --source=dashboard --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --platform=managed --allow-unauthenticated
 ```
 
-`dim_sellers` is the one Type 2 dimension (composite key `seller_id` +
-`valid_from`); every other dimension is Type 1. `fct_order_items`,
-`fct_order_payments`, and `fct_order_reviews` are kept as separate fact
-tables at their own natural grain rather than folded into `fct_orders`,
-since an order can have multiple items, payments, and reviews -- joining
-them into one row would fan out and inflate order-level metrics.
+No new IAM grant needed -- it runs as the same default compute service
+account already holding `bigquery.dataEditor` + `bigquery.jobUser` from
+step 3. `--allow-unauthenticated` means anyone with the URL can query
+BigQuery through this dashboard at your cost, with no auth check -- see
+[docs/dashboard.md](docs/dashboard.md) for the trade-off and the
+authenticated-only alternative.
+
+#### Spin down / restore the dashboard
+
+Cloud Run already scales to zero, so there's no idle compute cost to save
+by stopping it -- the actual thing worth turning off is the public URL
+itself. Deleting the service (not just leaving it idle) closes that off
+completely:
+
+```powershell
+gcloud run services delete olist-dashboard --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --quiet
+```
+
+Nothing is lost -- the service is built entirely from `dashboard/` in this
+repo. Restore it any time with the exact same command from step 9. The
+built container image stays in Artifact Registry after deletion (a small,
+ongoing storage cost) -- harmless to leave, or list/delete it with
+`gcloud artifacts docker images list` / `delete` if you'd rather not.
+
+### 10. Automate dbt build on code changes (Cloud Build -> Cloud Run Job)
+
+See [docs/automated_pipeline.md](docs/automated_pipeline.md#why-the-dbt-trigger-uses-completion-markers-and-a-lock-not-a-direct-call)
+for scope and reasoning. Create the dedicated trigger service account first
+(see [the IAM reference](docs/automated_pipeline.md#6-dbt-build-trigger-dedicated-service-account-you-create)
+for why a dedicated SA, not Cloud Build's default):
+
+```powershell
+gcloud iam service-accounts create dbt-build-trigger --project=project-858e450f-408c-4bd2-941 --display-name="Cloud Build trigger for dbt-build-job"
+
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:dbt-build-trigger@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com" --role="roles/logging.logWriter"
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:dbt-build-trigger@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com" --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding project-858e450f-408c-4bd2-941 --member="serviceAccount:dbt-build-trigger@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com" --role="roles/run.developer"
+gcloud iam service-accounts add-iam-policy-binding 588691405952-compute@developer.gserviceaccount.com --member="serviceAccount:dbt-build-trigger@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com" --role="roles/iam.serviceAccountUser" --project=project-858e450f-408c-4bd2-941
+```
+
+Bootstrap the image once, manually, so there's something for `gcloud run
+jobs create` to point at (the trigger only ever *updates* an existing job):
+
+```powershell
+gcloud builds submit --tag=gcr.io/project-858e450f-408c-4bd2-941/dbt-runner:latest dbt_olist --project=project-858e450f-408c-4bd2-941
+
+gcloud run jobs create dbt-build-job --image=gcr.io/project-858e450f-408c-4bd2-941/dbt-runner:latest --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --memory=1Gi --cpu=1 --task-timeout=1800s --max-retries=1
+```
+
+**Manual, one-time step that can't be scripted:** connect this GitHub repo
+to Cloud Build. It requires installing/authorizing the Cloud Build GitHub
+App against your GitHub account in a browser -- there's no CLI-only path
+around that OAuth consent screen. In the GCP Console: Cloud Build ->
+Triggers -> Connect Repository -> GitHub -> authorize -> select
+`NTungka/Module-2-Project`.
+
+Once connected, create the trigger, path-filtered to only fire on changes
+that could affect the dbt build (`--included-files="dbt_olist/**"`), and
+explicitly assigned to `dbt-build-trigger` (note: `--service-account`
+takes the full resource path, not just the bare email):
+
+```powershell
+gcloud builds triggers create github --name=dbt-build-on-merge --repo-name=Module-2-Project --repo-owner=NTungka --branch-pattern="^main$" --included-files="dbt_olist/**" --build-config=cloudbuild.yaml --service-account="projects/project-858e450f-408c-4bd2-941/serviceAccounts/dbt-build-trigger@project-858e450f-408c-4bd2-941.iam.gserviceaccount.com" --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941
+```
+
+### 11. Automate dbt build on data changes (event-driven)
+
+See [docs/automated_pipeline.md](docs/automated_pipeline.md#why-the-dbt-trigger-uses-completion-markers-and-a-lock-not-a-direct-call)
+for why this uses completion markers + an atomic lock instead of firing on
+every file merge. Grant the last deferred binding from the IAM reference --
+this must come *after* `dbt-build-job` exists (step 10):
+
+```powershell
+gcloud run jobs add-iam-policy-binding dbt-build-job --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --member="serviceAccount:588691405952-compute@developer.gserviceaccount.com" --role="roles/run.developer"
+```
+
+Then redeploy `load-gcs-to-bigquery` so the marker-tracking and trigger
+code in `main.py` actually ships (same command as step 6 -- deploys are
+idempotent):
+
+```powershell
+gcloud functions deploy load-gcs-to-bigquery --gen2 --runtime=python312 --region=asia-southeast1 --project=project-858e450f-408c-4bd2-941 --source=cloud_functions/load_gcs_to_bigquery --entry-point=load_gcs_to_bigquery --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" --trigger-event-filters="bucket=project-858e450f-408c-4bd2-941-olist-raw" --trigger-location=asia-southeast1 --set-env-vars='GCP_PROJECT_ID=project-858e450f-408c-4bd2-941,RAW_DATASET=raw,STAGE_DATASET=raw_stage'
+```
+
+From the next full pull onward, the chain runs itself end to end: Kaggle ->
+GCS -> `raw.*` -> (once all 9 land) `dbt-build-job` -> `staging.*` +
+`star_schema_olist.*`. Verify with `gcloud run jobs executions list
+--job=dbt-build-job --region=asia-southeast1
+--project=project-858e450f-408c-4bd2-941` after a full pull -- as the
+Status table above notes, this hasn't been exercised against a real batch
+yet, since `dbt-build-job` itself isn't provisioned.
 
 ## Known open items
 
-- Automation/scheduling for the BigQuery materialization + `dbt build` steps
-  (candidates: Cloud Scheduler + Cloud Run Job, or a scheduled GitHub Actions
-  workflow) -- currently all steps are run manually.
-- No BI dashboard tool connected yet.
+- Neither dbt-build automation path (code-triggered or data-triggered) is
+  actually provisioned yet -- see the Status table above for the precise,
+  live-verified gap. `dbt build` is 100% manual today.
+- Streamlit dashboard (`dashboard/`) is not currently deployed -- verified,
+  built, then deliberately deleted; see Status above and
+  [docs/dashboard.md](docs/dashboard.md).
 - `dim_customers` / `dim_products` SCD Type 2 decisions remain open pending
-  clarification of the live source system's design (see table above).
+  clarification of the live source system's design -- see
+  [docs/dbt_testing_and_staging.md](docs/dbt_testing_and_staging.md).
+- No Cloud Monitoring alert or notification is wired to a failed
+  `dbt-build-job` execution -- a failed automated build (once the
+  automation above is actually provisioned) is discoverable in logs, not
+  something that proactively pages anyone.
 
 ## Current Pipeline decisions
 
