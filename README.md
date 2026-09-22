@@ -377,3 +377,12 @@ yet, since `dbt-build-job` itself isn't provisioned.
 ## Current Pipeline decisions
 
 ![Current Pipeline decisions](./Software%20Architecture%20DB%20Project%202.jpeg)
+
+## Repo Citations
+This project utilizes contributions from different contributors whom took a seperate approach to the pipeline setup. They are cited here
+
+1. CI/CD & Automation + RestAPI Kaggle Approach (Mythili https://github.com/MCgit3/mod2_dbt_project)
+2. Dagster Orchestration + BQ Architecture (Priya https://github.com/Priya2026-debug/Module2_Bigdata_Proj)
+3. RestAPI Kaggle Approach & Streamlit Dashboard (Rohit https://github.com/reyanshjaiswal/rohit-module2-project
+4. Business Ideation & Alternate medallion architecture (Alok https://github.com/recianchap/Group_4_Module_2_Project)
+5. Business Ideation, Presentation & EDA/Analytics (Grace https://github.com/chungchung-coding/olist-data-platform) 
